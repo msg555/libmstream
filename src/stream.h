@@ -34,6 +34,7 @@ struct light_stream {
   struct light_stream* next;
 
   uint16_t tx_seq_num;
+  uint16_t packet_read_next;
 
   time_val time;
   time_val tx_time;
@@ -41,7 +42,7 @@ struct light_stream {
   struct heap tx_heap;
   struct heap rtx_heap;
 
-  uint16_t least_unacked_pkt;
+  uint16_t last_pkt_nxt;
   uint16_t missed_acks;
 
   size_t ack_pos;

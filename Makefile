@@ -1,4 +1,4 @@
-CFLAGS=-O3 -fPIC -Isrc -Iinclude
+CFLAGS=-g -fPIC -Isrc -Iinclude
 
 OBJECTS = \
   out/daemon.o \

@@ -7,7 +7,7 @@ struct congestion_info {
   int slow_start;
   time_val rtt;
   time_val rtt_ssq;
-  time_val spacing;
+  double spacing;
 };
 
 void _mstream_congestion_init(struct congestion_info* cinfo);

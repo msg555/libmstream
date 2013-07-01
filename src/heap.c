@@ -6,7 +6,7 @@ static void adjust(struct heap* h, size_t i) {
   void* tmp = h->heap[i];
   for(; i; ) {
     size_t p = (i - 1) >> 1;
-    if(!h->compare(h->heap[i], h->heap[p])) {
+    if(!h->compare(tmp, h->heap[p])) {
       break;
     }
     h->heap[i] = h->heap[p];
@@ -20,7 +20,7 @@ static void adjust(struct heap* h, size_t i) {
     if(c2 < h->size && h->compare(h->heap[c2], h->heap[c1])) {
       c1 = c2;
     }
-    if(!h->compare(h->heap[c1], h->heap[i])) {
+    if(!h->compare(h->heap[c1], tmp)) {
       break;
     }
     h->heap[i] = h->heap[c1];

@@ -109,18 +109,18 @@ int main(int argc, char** argv) {
     for(i = 0; i < sizeof(buf); i++) {
       buf[i] = i & 0xFF;
     }
-    for(i = 0; i < 1024*1024; i++) {
+    for(i = 0; i < 100*1024; i++) {
       size_t pos = 0;
       while(pos < sizeof(buf)) {
         pos += mstream_write(stream, 0, (char*)buf + pos, sizeof(buf) - pos, 0);
       }
-      //printf("Wrote %zu\n", pos);
+      if(!(i&0xFF))printf("Wrote %zu\n", i * sizeof(buf));
     }
   } else {
     uint32_t id = 0;
 
     unsigned char buf[1000];
-    for(i = 0; i < 1024*1024; i++) {
+    for(i = 0; i < 100*1024; i++) {
       size_t pos = 0;
       while(pos < sizeof(buf)) {
         pos += mstream_read(stream, &id,
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
           break;
         }
       }
-      //printf("Read %zu\n", pos);
+      if(!(i&0xFF))printf("Read %zu\n", i * sizeof(buf));
     }
   }
   mstream_flush(stream, MSTREAM_IDANY);
