@@ -108,33 +108,32 @@ int main(int argc, char** argv) {
 
   size_t i, j;
   unsigned char buf[1001];
-  if(!is_host) {
-    for(i = 0; i < sizeof(buf); i++) {
-      buf[i] = i & 0xFF;
+
+  for(i = 0; i < sizeof(buf); i++) {
+    buf[i] = i & 0xFF;
+  }
+  for(i = 0; i < 100*1024; i++) {
+    size_t pos = 0;
+    while(pos < sizeof(buf)) {
+      pos += mstream_write(stream, 0, (char*)buf + pos, sizeof(buf) - pos,
+                           MSTREAM_COPYNOW);
     }
-    for(i = 0; i < 100*1024; i++) {
-      size_t pos = 0;
-      while(pos < sizeof(buf)) {
-        pos += mstream_write(stream, 0, (char*)buf + pos, sizeof(buf) - pos, 0);
-      }
-      if(!(i&0xFF))printf("Wrote %zu\n", i * sizeof(buf));
+  }
+
+  uint32_t id = 0;
+  for(i = 0; i < 100*1024; i++) {
+    size_t pos = 0;
+    while(pos < sizeof(buf)) {
+      pos += mstream_read(stream, &id,
+                          (char*)buf + pos, sizeof(buf) - pos, 0);
     }
-  } else {
-    uint32_t id = 0;
-    for(i = 0; i < 100*1024; i++) {
-      size_t pos = 0;
-      while(pos < sizeof(buf)) {
-        pos += mstream_read(stream, &id,
-                            (char*)buf + pos, sizeof(buf) - pos, 0);
+    for(j = 0; j < sizeof(buf); j++) {
+      if(buf[j] != (j & 0xFF)) {
+        fprintf(stderr, "bad transmit %zu %u %zu\n", j, buf[j], j & 0xFF);
+        return 1;
       }
-      for(j = 0; j < sizeof(buf); j++) {
-        if(buf[j] != (j & 0xFF)) {
-          fprintf(stderr, "bad transmit %zu %u %zu\n", j, buf[j], j & 0xFF);
-          return 1;
-        }
-      }
-      if(!(i&0xFF))printf("Read %zu\n", i * sizeof(buf));
     }
+    if(!(i&0xFF))printf("Read %zu\n", i * sizeof(buf));
   }
   mstream_flush(stream, MSTREAM_IDANY);
 
