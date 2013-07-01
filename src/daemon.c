@@ -12,7 +12,6 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -44,7 +43,7 @@ static void* daemon_thread(void* parg) {
       break;
     }
 
-    time_val now = get_time();
+    time_val now = _mstream_get_time();
     for(ei = events, ee = events + nfds; ei != ee; ++ei) {
       if(ei->data.ptr == NULL) {
         /* NULL data pointer indicates a timer expiration. */
@@ -105,20 +104,20 @@ void _mstream_daemon_adjust_timer(struct mdaemon* daemon) {
   time_val ntime = !daemon->stream_heap.size ? 0 :
         ((struct light_stream*)_mstream_heap_top(&daemon->stream_heap))->time;
   if(daemon->thread_shutdown) {
-    ntime = get_time();
+    ntime = _mstream_get_time();
   }
   if(ntime != daemon->cur_timer) {
     struct itimerspec ispec;
     daemon->cur_timer = ntime;
 
-    time_val time_rel = ntime - get_time();
+    time_val time_rel = ntime - _mstream_get_time();
     if((stime_val)time_rel <= 0) time_rel = 1;
 
     ispec.it_interval.tv_sec = 0;
     ispec.it_interval.tv_nsec = 0;
     ispec.it_value.tv_sec = time_rel / 1000000;
     ispec.it_value.tv_nsec = (time_rel % 1000000) * 1000;
-    timerfd_settime(daemon->timerfd, 0, &ispec, NULL);
+    _mstream_timerfd_settime(daemon->timerfd, 0, &ispec, NULL);
   }
 }
 
@@ -126,7 +125,7 @@ void _mstream_daemon_adjust_timer(struct mdaemon* daemon) {
 struct mdaemon* mstream_daemon_create() {
   struct mdaemon* daemon = (struct mdaemon*)calloc(1, sizeof(struct mdaemon));
   daemon->epollfd = epoll_create(10);
-  daemon->timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  daemon->timerfd = _mstream_timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
 
   struct epoll_event ev;
   memset(&ev, 0, sizeof(ev));

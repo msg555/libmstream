@@ -58,6 +58,7 @@ static struct light_stream* lstream_create(struct mstream* stream,
                      datagram_get_tx_id, datagram_set_tx_id);
   _mstream_heap_init(&lstream->rtx_heap, datagram_compare_rtx_time,
                      datagram_get_rtx_id, datagram_set_rtx_id);
+  lstream->tx_tail = &lstream->tx;
   return lstream;
 }
 
@@ -73,7 +74,7 @@ static void recompute_times(struct light_stream* lstream, time_val now) {
   struct mstream* parent = lstream->parent;
 
   if(lstream->tx_time == 0) {
-    if((lstream->tx_buf_size &&
+    if((lstream->tx.buf_size &&
         !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) ||
         lstream->tx_heap.size) {
       /* Schedule a packet write. */
@@ -84,7 +85,7 @@ static void recompute_times(struct light_stream* lstream, time_val now) {
       lstream->tx_time = max_time(now,
           parent->tx_last + _mstream_congestion_spacing(&parent->cinfo));
     }
-  } else if(!((lstream->tx_buf_size &&
+  } else if(!((lstream->tx.buf_size &&
               !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) ||
               lstream->tx_heap.size || lstream->ack_size)) {
     lstream->tx_time = 0;
@@ -128,22 +129,50 @@ static size_t lstream_write(struct light_stream* lstream, const void* buf,
 
   pthread_mutex_lock(&parent->lock);
 
-  while(lstream->tx_buf_size == TX_BUFFER_SIZE) {
-    pthread_cond_wait(&lstream->cond, &parent->lock);
+  if(flags & MSTREAM_COPYNOW) {
+    while(len) {
+      amt = min_sz(len, TX_BUFFER_SIZE - lstream->tx_tail->buf_size);
+      len -= amt;
+      while(amt) {
+        size_t pos = (lstream->tx_tail->buf_pos + lstream->tx_tail->buf_size) &
+                        (TX_BUFFER_SIZE - 1);
+        size_t wamt = min_sz(amt, TX_BUFFER_SIZE - pos);
+        memcpy(lstream->tx_tail->buf + pos, cbuf, wamt);
+        cbuf += wamt;
+        amt -= wamt;
+        lstream->tx_tail->buf_size += wamt;
+      }
+
+      if(len) {
+        struct data_block* db = (struct data_block*)
+            malloc(sizeof(struct data_block));
+        db->buf_pos = 0;
+        db->buf_size = 0;
+        db->next = NULL;
+        lstream->tx_tail->next = db;
+        lstream->tx_tail = db;
+      }
+    }
+  } else {
+    if(~flags & MSG_DONTWAIT) {
+      while(lstream->tx.buf_size == TX_BUFFER_SIZE) {
+        pthread_cond_wait(&lstream->cond, &parent->lock);
+      }
+    }
+
+    amt = min_sz(len, TX_BUFFER_SIZE - lstream->tx.buf_size);
+    while(amt) {
+      size_t pos = (lstream->tx.buf_pos + lstream->tx.buf_size) &
+                      (TX_BUFFER_SIZE - 1);
+      size_t wamt = min_sz(amt, TX_BUFFER_SIZE - pos);
+      memcpy(lstream->tx.buf + pos, cbuf, wamt);
+      cbuf += wamt;
+      amt -= wamt;
+      lstream->tx.buf_size += wamt;
+    }
   }
 
-  amt = min_sz(len, TX_BUFFER_SIZE - lstream->tx_buf_size);
-  while(amt) {
-    size_t pos = (lstream->tx_buf_pos + lstream->tx_buf_size) &
-                    (TX_BUFFER_SIZE - 1);
-    size_t wamt = min_sz(amt, TX_BUFFER_SIZE - pos);
-    memcpy(lstream->tx_buf + pos, cbuf, wamt);
-    cbuf += wamt;
-    amt -= wamt;
-    lstream->tx_buf_size += wamt;
-  }
-
-  recompute_times(lstream, get_time());
+  recompute_times(lstream, _mstream_get_time());
   pthread_mutex_unlock(&parent->lock);
 
   return cbuf - (const char*)buf;
@@ -159,7 +188,7 @@ static void ack_packet(struct light_stream* lstream, uint16_t pkt_id) {
 
   lstream->ack_list[(lstream->ack_pos + lstream->ack_size++) &
                     (MAX_PACKETS - 1)] = pkt_id;
-  recompute_times(lstream, get_time());
+  recompute_times(lstream, _mstream_get_time());
 }
 
 static size_t lstream_read(struct light_stream* lstream, void* buf, size_t len,
@@ -186,13 +215,14 @@ static size_t lstream_read(struct light_stream* lstream, void* buf, size_t len,
     dg->read_pos += amt;
     len -= amt;
 
-    /* If we finished reading the packet free it, ack it, and move to the next
-     * packet. */
     if(dg->read_pos == dg->len) {
       free(dg);
       lstream->packets[lstream->packet_pos & (MAX_PACKETS - 1)] = NULL;
       lstream->packet_pos++;
     }
+  }
+  if(ready) {
+    *ready = lstream->packets[lstream->packet_pos & (MAX_PACKETS - 1)] != NULL;
   }
 
   pthread_mutex_unlock(&parent->lock);
@@ -288,20 +318,27 @@ static struct datagram* datagram_create(struct light_stream* lstream,
 static void transmit_packet(struct light_stream* lstream, uint64_t now) {
   struct datagram* dg = NULL;
   struct mstream* parent = lstream->parent;
-  if(lstream->tx_buf_size && lstream->tx_heap.size == 0 &&
+  if(lstream->tx.buf_size && lstream->tx_heap.size == 0 &&
      !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) {
     size_t bpos, dgbpos;
     size_t amt = min_sz(parent->mtu - HEADER_SIZE,
-                        lstream->tx_buf_size);
+                        lstream->tx.buf_size +
+                        (lstream->tx.next ? lstream->tx.next->buf_size : 0U));
     dg = datagram_create(lstream, amt + HEADER_SIZE);
     dg->tx_time = now;
 
-    for(bpos = lstream->tx_buf_pos, dgbpos = HEADER_SIZE; amt; ) {
-      size_t wamt = min_sz(TX_BUFFER_SIZE - bpos, amt);
-      memcpy(dg->buf + dgbpos, lstream->tx_buf + bpos, wamt);
-      bpos = (bpos + wamt) & (TX_BUFFER_SIZE - 1);
-      dgbpos  += wamt;
-      amt -= wamt;
+    struct data_block* db = &lstream->tx;
+    for(dgbpos = HEADER_SIZE; amt; db = db->next) {
+      size_t tamt = min_sz(amt, db->buf_size);
+      amt -= tamt;
+
+      for(bpos = db->buf_pos; tamt; ) {
+        size_t wamt = min_sz(TX_BUFFER_SIZE - bpos, tamt);
+        memcpy(dg->buf + dgbpos, db->buf + bpos, wamt);
+        bpos = (bpos + wamt) & (TX_BUFFER_SIZE - 1);
+        dgbpos += wamt;
+        tamt -= wamt;
+      }
     }
 
     /* Transmit the new datagram and adjust the MTU size as needed. */
@@ -317,12 +354,28 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
       }
     }
 
-    if(lstream->tx_buf_size == TX_BUFFER_SIZE) {
-      pthread_cond_broadcast(&lstream->cond);
+    amt = dg->len - HEADER_SIZE;
+    while(amt) {
+      if(!lstream->tx.next && lstream->tx.buf_size == TX_BUFFER_SIZE) {
+        pthread_cond_broadcast(&lstream->cond);
+      }
+
+      size_t tamt = min_sz(amt, lstream->tx.buf_size);
+      lstream->tx.buf_pos = (lstream->tx.buf_pos + tamt) &
+                            (TX_BUFFER_SIZE - 1);
+      lstream->tx.buf_size -= tamt;
+      amt -= tamt;
+
+      if(lstream->tx.buf_size == 0 && lstream->tx.next) {
+        struct data_block* db = lstream->tx.next;
+        memcpy(&lstream->tx, db, sizeof(struct data_block));
+        free(db);
+
+        if(!lstream->tx.next) {
+          lstream->tx_tail = &lstream->tx;
+        }
+      }
     }
-    lstream->tx_buf_pos = (lstream->tx_buf_pos + dg->len - HEADER_SIZE) &
-                          (TX_BUFFER_SIZE - 1);
-    lstream->tx_buf_size -= dg->len - HEADER_SIZE;
   } else if(lstream->tx_heap.size) {
     dg = (struct datagram*)_mstream_heap_pop(&lstream->tx_heap);
     dg->tx_time = 0;
@@ -413,13 +466,13 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
 
   pthread_mutex_lock(&stream->lock);
 
+  int fresh_data = 0;
   struct light_stream* lstream = stream_get_locked(stream, id);
 
   for(; lstream->last_pkt_nxt != pkt_nxt; ++lstream->last_pkt_nxt) {
     acknowledge_packet(lstream, lstream->last_pkt_nxt, now);
     lstream->missed_acks = 0;
   }
-printf("WINDING %u\n", lstream->last_pkt_nxt);
 
   acknowledge_packet(lstream, ack_id1, now);
   acknowledge_packet(lstream, ack_id2, now);
@@ -428,7 +481,7 @@ printf("WINDING %u\n", lstream->last_pkt_nxt);
     if((int16_t)(pkt_id - lstream->packet_pos) < (int16_t)MAX_PACKETS) {
       ack_packet(lstream, pkt_id);
     }
-    if(pkt_id - lstream->packet_pos < MAX_PACKETS &&
+    if((uint16_t)(pkt_id - lstream->packet_pos) < MAX_PACKETS &&
               !lstream->packets[pkt_id & (MAX_PACKETS - 1)]) {
       ack_packet(lstream, pkt_id);
 
@@ -439,6 +492,7 @@ printf("WINDING %u\n", lstream->last_pkt_nxt);
       memcpy(dg->buf, ((const char*)buf) + HEADER_SIZE, len);
 
       if(pkt_id == lstream->packet_pos) {
+        fresh_data = 1;
         pthread_cond_broadcast(&lstream->cond);
       }
       while((lstream->packet_read_next - lstream->packet_pos) < MAX_PACKETS &&
@@ -452,7 +506,6 @@ printf("WINDING %u\n", lstream->last_pkt_nxt);
       lstream->out_packets[pkt_nxt & (MAX_PACKETS - 1)];
   if(dg) {
     if(++lstream->missed_acks == 3) {
-printf("Fast RTX %u %u %u\n", id, pkt_nxt, lstream->tx_seq_num);
       if(!stream->congestion_event) {
         _mstream_congestion_rtx(&stream->cinfo);
         stream->congestion_event = 1;
@@ -468,6 +521,10 @@ printf("Fast RTX %u %u %u\n", id, pkt_nxt, lstream->tx_seq_num);
   }
 
   pthread_mutex_unlock(&stream->lock);
+
+  if(fresh_data && stream->arrival_func) {
+    stream->arrival_func(stream, id);
+  }
 }
 
 void _mstream_transmit(struct light_stream* lstream, uint64_t now) {
@@ -485,13 +542,14 @@ void _mstream_transmit(struct light_stream* lstream, uint64_t now) {
     }
     /* RTOs should always trigger a congestion event so that we'll always back
      * off if the remote stops responding. */
-    _mstream_congestion_rtx(&parent->cinfo);
-/*
-    parent->congestion_event = 1;
-    parent->congestion_event_lid = lstream->id;
-    parent->congestion_event_pkt = dg->tx_index;
-*/
-printf("GOT RTO %u\n", dg->tx_index);
+
+    if(dg->tx_index == lstream->last_pkt_nxt) {
+      _mstream_congestion_rtx(&parent->cinfo);
+
+      parent->congestion_event = 1;
+      parent->congestion_event_lid = lstream->id;
+      parent->congestion_event_pkt = dg->tx_index;
+    }
 
     _mstream_heap_pop(&lstream->rtx_heap);
     _mstream_heap_add(&lstream->tx_heap, dg);
@@ -504,10 +562,6 @@ printf("GOT RTO %u\n", dg->tx_index);
   }
 
   recompute_times(lstream, now);
-/*
-printf("GOT TIME %llu %llu %llu %llu\n", lstream->time, lstream->time - now,
-lstream->tx_time);
-*/
 
   if(lstream->time == 0) {
     /* Nothing to schedule, notify those waiting in flush. */
@@ -519,10 +573,12 @@ lstream->tx_time);
 
 /* libmstream public API */
 
-struct mstream* mstream_create(struct mdaemon* daemon, int fd) {
+struct mstream* mstream_create(struct mdaemon* daemon, int fd,
+                               data_arrival arrival_func) {
   struct mstream* stream = (struct mstream*)calloc(1, sizeof(struct mstream));
   stream->daemon = daemon;
   stream->fd = fd;
+  stream->arrival_func = arrival_func;
   stream->mtu = MAX_MTU;
 
   _mstream_congestion_init(&stream->cinfo);
@@ -594,7 +650,8 @@ size_t mstream_read(struct mstream* stream, uint32_t* id,
 }
 
 struct mstream* mstream_listen(struct mdaemon* daemon, int fd,
-                        struct sockaddr* src_addr, socklen_t* src_addrlen) {
+                        struct sockaddr* src_addr, socklen_t* src_addrlen,
+                        data_arrival arrival_func) {
   struct sockaddr addr;
   struct sockaddr bind_addr;
   socklen_t addrlen = sizeof(addr);
@@ -639,7 +696,7 @@ struct mstream* mstream_listen(struct mdaemon* daemon, int fd,
     return NULL;
   }
 
-  struct mstream* stream = mstream_create(daemon, s);
-  _mstream_datagram_arrived(stream, buf, amt, get_time());
+  struct mstream* stream = mstream_create(daemon, s, arrival_func);
+  _mstream_datagram_arrived(stream, buf, amt, _mstream_get_time());
   return stream;
 }

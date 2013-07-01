@@ -1,4 +1,4 @@
-CFLAGS=-O3 -I../include
+CFLAGS=-g -I../include
 LDFLAGS=../out/libmstream.a -lpthread -lm
 
 all: simple

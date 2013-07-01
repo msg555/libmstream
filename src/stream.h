@@ -7,6 +7,8 @@
 #include "congestion.h"
 #include "heap.h"
 
+#include <mstream.h>
+
 struct mdaemon;
 struct mstream;
 struct rdatagram;
@@ -22,6 +24,13 @@ struct datagram {
 
   size_t len;
   char buf[1];
+};
+
+struct data_block {
+  struct data_block* next;
+  size_t buf_pos;
+  size_t buf_size;
+  char buf[TX_BUFFER_SIZE];
 };
 
 struct light_stream {
@@ -53,14 +62,14 @@ struct light_stream {
   struct rdatagram* packets[MAX_PACKETS];
   struct datagram* out_packets[MAX_PACKETS];
 
-  size_t tx_buf_pos;
-  size_t tx_buf_size;
-  char tx_buf[TX_BUFFER_SIZE];
+  struct data_block* tx_tail;
+  struct data_block tx;
 };
 
 struct mstream {
   struct mdaemon* daemon;
   int fd;
+  data_arrival arrival_func;
 
   size_t streams_size;
   struct light_stream** streams;

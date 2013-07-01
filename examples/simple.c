@@ -14,6 +14,9 @@ void print_usage(FILE* fout, const char* argv0) {
                  "--host          Run host client.\n", argv0);
 }
 
+void data(struct mstream* stream, uint32_t id) {
+}
+
 int main(int argc, char** argv) {
   int is_host = 0;
   char* argv0 = argv[0];
@@ -87,7 +90,7 @@ int main(int argc, char** argv) {
       perror("bind");
       return 1;
     }
-    stream = mstream_listen(daemon, s, NULL, NULL);
+    stream = mstream_listen(daemon, s, NULL, NULL, data);
 
     if(!stream) {
       printf("mstream_listen failed\n");
@@ -100,12 +103,12 @@ int main(int argc, char** argv) {
       perror("connect");
       return 1;
     }
-    stream = mstream_create(daemon, s);
+    stream = mstream_create(daemon, s, data);
   }
 
   size_t i, j;
+  unsigned char buf[1001];
   if(!is_host) {
-    unsigned char buf[1000];
     for(i = 0; i < sizeof(buf); i++) {
       buf[i] = i & 0xFF;
     }
@@ -118,8 +121,6 @@ int main(int argc, char** argv) {
     }
   } else {
     uint32_t id = 0;
-
-    unsigned char buf[1000];
     for(i = 0; i < 100*1024; i++) {
       size_t pos = 0;
       while(pos < sizeof(buf)) {
@@ -128,8 +129,8 @@ int main(int argc, char** argv) {
       }
       for(j = 0; j < sizeof(buf); j++) {
         if(buf[j] != (j & 0xFF)) {
-          fprintf(stderr, "bad transmit %u %u %u\n", j, buf[j], j & 0xFF);
-          break;
+          fprintf(stderr, "bad transmit %zu %u %zu\n", j, buf[j], j & 0xFF);
+          return 1;
         }
       }
       if(!(i&0xFF))printf("Read %zu\n", i * sizeof(buf));

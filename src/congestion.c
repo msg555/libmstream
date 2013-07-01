@@ -1,5 +1,7 @@
 #include "congestion.h"
 
+#include <math.h>
+
 void _mstream_congestion_init(struct congestion_info* cinfo) {
   cinfo->slow_start = 1;
   cinfo->rtt = 500000;
@@ -23,8 +25,6 @@ void _mstream_congestion_ack(struct congestion_info* cinfo, time_val rtt) {
     cinfo->spacing = 1.0 / (1.0 / cinfo->spacing +
                             1.0 * cinfo->spacing / cinfo->rtt / cinfo->rtt);
   }
-printf("ACK UPDATE %d %.1f %llu %llu\n", cinfo->slow_start, cinfo->spacing,
-                                         cinfo->rtt, rtt);
 }
 
 void _mstream_congestion_rtx(struct congestion_info* cinfo) {
@@ -33,7 +33,6 @@ void _mstream_congestion_rtx(struct congestion_info* cinfo) {
   if(cinfo->spacing > 3e6) {
     cinfo->spacing = 3e6;
   }
-printf("RTX UPDATE %.f\n", cinfo->spacing);
 }
 
 time_val _mstream_congestion_rtt(struct congestion_info* cinfo) {
