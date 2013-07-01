@@ -20,6 +20,7 @@ struct datagram {
   time_val rtx_time;
   size_t rtx_heap_id;
 
+  size_t tx_count;
   time_val tx_time;
 
   size_t len;

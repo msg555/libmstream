@@ -304,6 +304,7 @@ static struct datagram* datagram_create(struct light_stream* lstream,
   dg->len = len;
   dg->tx_index = lstream->tx_seq_num++;
   dg->tx_heap_id = dg->rtx_heap_id = 0;
+  dg->tx_count = 1;
 
   lstream->out_packets[dg->tx_index & (MAX_PACKETS - 1)] = dg;
   *(uint32_t*)dg->buf = htonl(lstream->id);
@@ -343,8 +344,7 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
 
     /* Transmit the new datagram and adjust the MTU size as needed. */
     for(;;) {
-      ssize_t res = TEMP_FAILURE_RETRY(
-              send(parent->fd, dg->buf, dg->len, MSG_DONTWAIT));
+      ssize_t res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
       if(res == -1 && errno == EMSGSIZE) {
         /* Linux MTU discovery is telling us our packet is too large. */
         dg->len = --parent->mtu;
@@ -380,10 +380,16 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
     dg = (struct datagram*)_mstream_heap_pop(&lstream->tx_heap);
     dg->tx_time = 0;
 
-    /* Transmit packet.  Since we cannot adjust the size of the packet if the
-     * set fails due to message size we allow fragmentation and try again. */
-    ssize_t res = TEMP_FAILURE_RETRY(
-            send(parent->fd, dg->buf, dg->len, MSG_DONTWAIT));
+    ssize_t res;
+    if(++dg->tx_count >= 3 && dg->len < parent->mtu) {
+      size_t extra_len = parent->mtu - dg->len;
+      void* extra = alloca(extra_len);
+      memset(extra, 0, extra_len);
+      TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, MSG_MORE));
+      res = TEMP_FAILURE_RETRY(send(parent->fd, extra, extra_len, 0));
+    } else {
+      res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
+    }
     if(res == -1 && errno == EMSGSIZE) {
       int oval;
       socklen_t len = sizeof(oval);
@@ -460,8 +466,19 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
   uint16_t ack_id2 = ntohs(((uint16_t*)buf)[6]);
 
   if(HEADER_SIZE + len != amt) {
-    /* If length doesn't add up drop the packet. */
-    return;
+    /* If length doesn't add up drop the packet.  To get around some filtering
+     * rules we sometimes increase the size of the packet and pad with zeroes.
+     */
+    if(HEADER_SIZE + len < amt) {
+      size_t extra_len = amt - (HEADER_SIZE + len);
+      char* extra_base = (char*)buf + amt - extra_len;
+
+      if(*extra_base || memcmp(extra_base, extra_base + 1, extra_len - 1)) {
+        return;
+      }
+    } else {
+      return;
+    }
   }
 
   pthread_mutex_lock(&stream->lock);
