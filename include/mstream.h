@@ -1,6 +1,10 @@
 #ifndef MSTREAM_MSTREAM_H
 #define MSTREAM_MSTREAM_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 #include <sys/socket.h>
@@ -36,5 +40,10 @@ size_t mstream_write(struct mstream* stream, uint32_t id,
 
 size_t mstream_read(struct mstream* stream, uint32_t* id,
                     void* buf, size_t len, int flags);
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
