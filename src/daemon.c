@@ -82,6 +82,10 @@ static void* daemon_thread(void* parg) {
         }
       }
     }
+
+    pthread_mutex_lock(&self->lock);
+    _mstream_daemon_adjust_timer(self);
+    pthread_mutex_unlock(&self->lock);
   }
   return NULL;
 }
