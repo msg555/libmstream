@@ -430,12 +430,12 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
   }
 }
 
-static void acknowledge_packet(struct light_stream* lstream, uint16_t id,
-                               time_val now) {
+static int acknowledge_packet(struct light_stream* lstream, uint16_t id,
+                              time_val now) {
   struct mstream* parent = lstream->parent;
   struct datagram* dg = lstream->out_packets[id & (MAX_PACKETS - 1)];
   if(!dg || dg->tx_index != id || (int16_t)(id - lstream->last_pkt_nxt) < 0) {
-    return;
+    return 0;
   }
   if(parent->congestion_event && lstream->id == parent->congestion_event_lid &&
      id == parent->congestion_event_pkt) {
@@ -457,6 +457,8 @@ static void acknowledge_packet(struct light_stream* lstream, uint16_t id,
 
   /* It's possible we've allowed a write to happen by ack'ing a packet. */
   recompute_times(lstream, now);
+
+  return 1;
 }
 
 /* Internal libmstream functions. */
@@ -491,15 +493,20 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
   struct light_stream* lstream = stream_get_locked(stream, id);
 
   for(; (int16_t)(lstream->last_pkt_nxt - pkt_nxt) < 0; ) {
-    acknowledge_packet(lstream, lstream->last_pkt_nxt, now);
-    lstream->missed_acks = 0;
+    if(!acknowledge_packet(lstream, lstream->last_pkt_nxt, now)) {
+      --lstream->future_acks;
+    }
     if(lstream->tx_seq_num == ++lstream->last_pkt_nxt) {
       pthread_cond_broadcast(&lstream->cond);
     }
   }
 
-  acknowledge_packet(lstream, ack_id1, now);
-  acknowledge_packet(lstream, ack_id2, now);
+  if(acknowledge_packet(lstream, ack_id1, now)) {
+    ++lstream->future_acks;
+  }
+  if(acknowledge_packet(lstream, ack_id2, now)) {
+    ++lstream->future_acks;
+  }
 
   if(len && lstream) {
     if((int16_t)(pkt_id - lstream->packet_pos) < (int16_t)MAX_PACKETS) {
@@ -532,16 +539,16 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
     }
   }
 
-  struct datagram* dg = (struct datagram*)
-      lstream->out_packets[pkt_nxt & (MAX_PACKETS - 1)];
-  if(dg) {
-    if(++lstream->missed_acks == 3) {
-      if(!stream->congestion_event) {
-        _mstream_congestion_rtx(&stream->cinfo);
-        stream->congestion_event = 1;
-        stream->congestion_event_lid = lstream->id;
-        stream->congestion_event_pkt = pkt_nxt;
-      }
+  /* Check if we need to do a fast retransmit. */
+  if(!stream->congestion_event && lstream->future_acks >= 3) {
+    struct datagram* dg = (struct datagram*)
+        lstream->out_packets[pkt_nxt & (MAX_PACKETS - 1)];
+    if(dg) {
+      _mstream_congestion_rtx(&stream->cinfo);
+      stream->congestion_event = 1;
+      stream->congestion_event_lid = lstream->id;
+      stream->congestion_event_pkt = pkt_nxt;
+
       _mstream_heap_remove(&lstream->rtx_heap, dg);
       _mstream_heap_remove(&lstream->tx_heap, dg);
       _mstream_heap_add(&lstream->tx_heap, dg);

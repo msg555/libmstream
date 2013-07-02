@@ -53,7 +53,7 @@ struct light_stream {
   struct heap rtx_heap;
 
   uint16_t last_pkt_nxt;
-  uint16_t missed_acks;
+  uint16_t future_acks;
 
   size_t ack_pos;
   size_t ack_size;
