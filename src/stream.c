@@ -17,6 +17,7 @@ static const size_t HEADER_SIZE = 14;
 struct rdatagram {
   size_t len;
   size_t read_pos;
+  uint16_t id;
   char buf[1];
 };
 
@@ -231,7 +232,7 @@ static size_t lstream_read(struct light_stream* lstream, void* buf, size_t len,
 
 static void lstream_flush(struct light_stream* lstream) {
   pthread_mutex_lock(&lstream->parent->lock);
-  while(lstream->time) {
+  while(lstream->time || lstream->last_pkt_nxt != lstream->tx_seq_num) {
     pthread_cond_wait(&lstream->cond, &lstream->parent->lock);
   }
   pthread_mutex_unlock(&lstream->parent->lock);
@@ -378,6 +379,9 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
     }
   } else if(lstream->tx_heap.size) {
     dg = (struct datagram*)_mstream_heap_pop(&lstream->tx_heap);
+    ((uint16_t*)dg->buf)[4] = htons(lstream->packet_read_next);
+    ((uint16_t*)dg->buf)[5] = htons(pop_ack(lstream));
+    ((uint16_t*)dg->buf)[6] = htons(pop_ack(lstream));
     dg->tx_time = 0;
 
     ssize_t res;
@@ -486,9 +490,12 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
   int fresh_data = 0;
   struct light_stream* lstream = stream_get_locked(stream, id);
 
-  for(; lstream->last_pkt_nxt != pkt_nxt; ++lstream->last_pkt_nxt) {
+  for(; (int16_t)(lstream->last_pkt_nxt - pkt_nxt) < 0; ) {
     acknowledge_packet(lstream, lstream->last_pkt_nxt, now);
     lstream->missed_acks = 0;
+    if(lstream->tx_seq_num == ++lstream->last_pkt_nxt) {
+      pthread_cond_broadcast(&lstream->cond);
+    }
   }
 
   acknowledge_packet(lstream, ack_id1, now);
@@ -506,14 +513,20 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
           (struct rdatagram*)malloc(offsetof(struct rdatagram, buf) + len);
       dg->len = len;
       dg->read_pos = 0;
+      dg->id = pkt_id;
       memcpy(dg->buf, ((const char*)buf) + HEADER_SIZE, len);
 
       if(pkt_id == lstream->packet_pos) {
         fresh_data = 1;
         pthread_cond_broadcast(&lstream->cond);
       }
-      while((lstream->packet_read_next - lstream->packet_pos) < MAX_PACKETS &&
-             lstream->packets[lstream->packet_read_next & (MAX_PACKETS - 1)]) {
+
+      while(1) {
+        struct rdatagram* dg =
+            lstream->packets[lstream->packet_read_next & (MAX_PACKETS - 1)];
+        if(!dg || dg->id != lstream->packet_read_next) {
+          break;
+        }
         ++lstream->packet_read_next;
       }
     }
