@@ -401,7 +401,7 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
 
       int val = IP_PMTUDISC_DONT;
       setsockopt(parent->fd, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val));
-      TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, MSG_DONTWAIT));
+      TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
       setsockopt(parent->fd, IPPROTO_IP, IP_MTU_DISCOVER, &oval, sizeof(oval));
     }
   } else {
@@ -415,7 +415,7 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
     ((uint16_t*)buf)[4] = htons(lstream->packet_read_next);
     ((uint16_t*)buf)[5] = htons(pop_ack(lstream));
     ((uint16_t*)buf)[6] = htons(pop_ack(lstream));
-    TEMP_FAILURE_RETRY(send(parent->fd, buf, HEADER_SIZE, MSG_DONTWAIT));
+    TEMP_FAILURE_RETRY(send(parent->fd, buf, HEADER_SIZE, 0));
   }
 
   /* Insert the datagram into the retransmit heap. */
@@ -581,7 +581,7 @@ void _mstream_transmit(struct light_stream* lstream, uint64_t now) {
      * off if the remote stops responding. */
 
     if(dg->tx_index == lstream->last_pkt_nxt) {
-      _mstream_congestion_rtx(&parent->cinfo);
+      _mstream_congestion_rto(&parent->cinfo);
 
       parent->congestion_event = 1;
       parent->congestion_event_lid = lstream->id;
@@ -636,6 +636,8 @@ void mstream_destroy(struct mstream* stream) {
     }
   }
   free(stream->streams);
+  close(stream->fd);
+  free(stream);
 }
 
 void mstream_flush(struct mstream* stream, uint32_t id) {

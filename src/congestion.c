@@ -23,6 +23,12 @@ void _mstream_congestion_ack(struct congestion_info* cinfo, time_val rtt) {
                         cinfo->rtt_ssq + rtt * rtt) >> shft;
   }
   if(cinfo->slow_start) {
+    if(cinfo->spacing > cinfo->rtt / 10.0) {
+      cinfo->spacing = cinfo->rtt / 10.0;
+    }
+    if(rtt && cinfo->spacing > rtt / 10.0) {
+      cinfo->spacing = rtt / 10.0;
+    }
     cinfo->spacing = 1.0 / (1.0 / cinfo->spacing + 1.0 / cinfo->rtt);
   } else {
     cinfo->spacing = 1.0 / (1.0 / cinfo->spacing +
@@ -36,6 +42,11 @@ void _mstream_congestion_rtx(struct congestion_info* cinfo) {
   if(cinfo->spacing > 3e6) {
     cinfo->spacing = 3e6;
   }
+}
+
+void _mstream_congestion_rto(struct congestion_info* cinfo) {
+  cinfo->slow_start = 1;
+  cinfo->spacing = cinfo->rtt / 10.0;
 }
 
 time_val _mstream_congestion_rtt(struct congestion_info* cinfo) {

@@ -33,7 +33,6 @@ struct mdaemon {
   pthread_mutex_t lock;
 
   int thread_shutdown;
-  int thread_created;
   pthread_t thread;
 };
 

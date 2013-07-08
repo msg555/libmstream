@@ -100,8 +100,8 @@ void _mstream_attach_stream(struct mdaemon* daemon, struct mstream* stream) {
 }
 
 void _mstream_detach_stream(struct mdaemon* daemon, struct mstream* stream) {
-  struct epoll_event ev;
-  epoll_ctl(daemon->epollfd, EPOLL_CTL_DEL, stream->fd, &ev);
+  // struct epoll_event ev;
+  // epoll_ctl(daemon->epollfd, EPOLL_CTL_DEL, stream->fd, &ev);
 }
 
 void _mstream_daemon_adjust_timer(struct mdaemon* daemon) {
@@ -151,7 +151,6 @@ void mstream_daemon_stop(struct mdaemon* daemon) {
   _mstream_daemon_adjust_timer(daemon);
 
   pthread_join(daemon->thread, NULL);
-  daemon->thread_created = 0;
   daemon->thread_shutdown = 0;
 }
 
