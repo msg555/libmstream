@@ -1,10 +1,13 @@
 CFLAGS=-g -I../include
 LDFLAGS=../out/libmstream.a -lpthread -lm
 
-all: simple
+all: single multi
 
-simple: simple.c
-	$(CC) $(CFLAGS) simple.c -o simple $(LDFLAGS)
+single: single.c
+	$(CC) $(CFLAGS) single.c -o single $(LDFLAGS)
+
+multi: multi.c
+	$(CC) $(CFLAGS) multi.c -o multi $(LDFLAGS)
 
 clean:
-	rm -f simple
+	rm -f single multi

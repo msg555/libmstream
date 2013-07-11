@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#define IDS 16
+#define ROUNDS 1024
+
 void print_usage(FILE* fout, const char* argv0) {
   fprintf(fout, "usage: %s [options] [host:]port\n"
                  "  [host:] is not optional when running in client mode\n"
@@ -107,35 +110,49 @@ int main(int argc, char** argv) {
   }
 
   size_t i, j;
-  unsigned char buf[1001];
+  unsigned char buf[IDS][1001];
 
-  for(i = 0; i < sizeof(buf); i++) {
-    buf[i] = i & 0xFF;
-  }
-  for(i = 0; i < 100*1024; i++) {
-    size_t pos = 0;
-    while(pos < sizeof(buf)) {
-      pos += mstream_write(stream, 0, (char*)buf + pos, sizeof(buf) - pos,
-                           MSTREAM_COPYNOW);
+  for(i = 0; i < IDS; i++) {
+    for(j = 0; j < sizeof(buf[i]); j++) {
+      buf[i][j] = (i + j) & 0xFF;
     }
   }
-
-  uint32_t id = 0;
-  for(i = 0; i < 100*1024; i++) {
-    size_t pos = 0;
-    while(pos < sizeof(buf)) {
-      pos += mstream_read(stream, &id,
-                          (char*)buf + pos, sizeof(buf) - pos, 0);
-    }
-    for(j = 0; j < sizeof(buf); j++) {
-      if(buf[j] != (j & 0xFF)) {
-        fprintf(stderr, "bad transmit %zu %u %zu\n", j, buf[j], j & 0xFF);
-        return 1;
+  for(j = 0; j < ROUNDS; j++) {
+    for(i = 0; i < IDS; i++) {
+      size_t pos = 0;
+      while(pos < sizeof(buf[i])) {
+        pos += mstream_write(stream, i & 127, (char*)buf[i] + pos,
+                             sizeof(buf[i]) - pos, MSTREAM_COPYNOW);
       }
     }
-    if(!(i&0xFF))printf("Read %zu\n", i * sizeof(buf));
+  }
+
+printf("READING\n");
+  size_t finished = 0;
+  size_t received[IDS] = {0};
+  for(; finished < IDS; ) {
+    unsigned char rbuf[1001];
+    uint32_t id = MSTREAM_IDANY;
+    size_t amt = mstream_read(stream, &id, (char*)rbuf, sizeof(rbuf), 0);
+
+    int doprint = 0;
+    for(i = 0; i < amt; i++) {
+      if(rbuf[i] != buf[id][received[id]++ % sizeof(buf[id])]) {
+        fprintf(stderr, "bad transmit\n");
+        return 1;
+      }
+      doprint |= !((received[id]/sizeof(buf[id]))&0xF);
+    }
+    if(doprint)printf("Read %u\n", id);
+    if(received[id] == ROUNDS * sizeof(buf[id])) {
+      finished++;
+    }
   }
   mstream_flush(stream, MSTREAM_IDANY);
 
+  struct stream_info info;
+  mstream_info(stream, &info);
+  printf("RTT: %lld\n", (long long)info.rtt);
+  printf("RTTVAR: %lld\n", (long long)info.rttvar);
   return 0;
 }

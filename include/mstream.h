@@ -19,6 +19,13 @@ struct mstream;
 
 typedef void(*data_arrival)(struct mstream*, uint32_t);
 
+typedef uint64_t time_val;
+
+struct stream_info {
+  time_val rtt;
+  time_val rttvar;
+};
+
 struct mdaemon* mstream_daemon_create();
 void mstream_daemon_start(struct mdaemon* daemon);
 void mstream_daemon_stop(struct mdaemon* daemon);
@@ -41,6 +48,7 @@ size_t mstream_write(struct mstream* stream, uint32_t id,
 size_t mstream_read(struct mstream* stream, uint32_t* id,
                     void* buf, size_t len, int flags);
 
+void mstream_info(struct mstream* stream, struct stream_info* info);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,8 @@
 #ifndef MSTREAM_COMMON_H
 #define MSTREAM_COMMON_H
 
+#include <mstream.h>
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,7 +14,6 @@
 #define MAYBE_UNUSED
 #endif
 
-typedef uint64_t time_val;
 typedef int64_t stime_val;
 
 struct itimerspec;

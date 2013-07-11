@@ -21,6 +21,9 @@ struct rdatagram {
   char buf[1];
 };
 
+static void transmit_packet(struct light_stream* lstream, uint64_t now,
+                            int ack_only);
+
 static int datagram_compare_tx_order(void* px, void* py) {
   return (int16_t)(((struct datagram*)px)->tx_index -
                    ((struct datagram*)py)->tx_index) < 0;
@@ -189,15 +192,13 @@ static void ack_packet(struct light_stream* lstream, uint16_t pkt_id) {
 
   lstream->ack_list[(lstream->ack_pos + lstream->ack_size++) &
                     (MAX_PACKETS - 1)] = pkt_id;
-  recompute_times(lstream, _mstream_get_time());
+  transmit_packet(lstream, _mstream_get_time(), 1);
 }
 
-static size_t lstream_read(struct light_stream* lstream, void* buf, size_t len,
-                           int flags, int* ready) {
+static size_t lstream_read_locked(struct light_stream* lstream, void* buf,
+                                  size_t len, int flags, int* ready) {
   char* cbuf = (char*)buf;
   struct mstream* parent = lstream->parent;
-
-  pthread_mutex_lock(&parent->lock);
 
   /* Wait for data if requested. */
   if(~flags & MSG_DONTWAIT) {
@@ -225,8 +226,6 @@ static size_t lstream_read(struct light_stream* lstream, void* buf, size_t len,
   if(ready) {
     *ready = lstream->packets[lstream->packet_pos & (MAX_PACKETS - 1)] != NULL;
   }
-
-  pthread_mutex_unlock(&parent->lock);
   return cbuf - (char*)buf;
 }
 
@@ -265,7 +264,10 @@ static struct light_stream* stream_get(struct mstream* stream, uint32_t id) {
 
 static void stream_list_push_locked(struct mstream* stream,
                                     struct light_stream* lstream) {
-  lstream->next = NULL;
+  /* Already in the ready list. */
+  if(lstream->next) return;
+
+  lstream->next = lstream;
   if(stream->ready_head) {
     stream->ready_tail->next = lstream;
     stream->ready_tail = lstream;
@@ -278,10 +280,10 @@ static void stream_list_push_locked(struct mstream* stream,
 static void stream_list_pop_locked(struct mstream* stream) {
   struct light_stream* head = stream->ready_head;
   if(head->next) {
-    head->next = stream->ready_head = stream->ready_tail = NULL;
-  } else {
     stream->ready_head = head->next;
     head->next = NULL;
+  } else {
+    head->next = stream->ready_head = stream->ready_tail = NULL;
   }
 }
 
@@ -317,10 +319,11 @@ static struct datagram* datagram_create(struct light_stream* lstream,
   return dg;
 }
 
-static void transmit_packet(struct light_stream* lstream, uint64_t now) {
+static void transmit_packet(struct light_stream* lstream, uint64_t now,
+                            int ack_only) {
   struct datagram* dg = NULL;
   struct mstream* parent = lstream->parent;
-  if(lstream->tx.buf_size && lstream->tx_heap.size == 0 &&
+  if(!ack_only && lstream->tx.buf_size && lstream->tx_heap.size == 0 &&
      !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) {
     size_t bpos, dgbpos;
     size_t amt = min_sz(parent->mtu - HEADER_SIZE,
@@ -345,7 +348,8 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
 
     /* Transmit the new datagram and adjust the MTU size as needed. */
     for(;;) {
-      ssize_t res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
+      ssize_t res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len,
+                                            MSG_DONTWAIT));
       if(res == -1 && errno == EMSGSIZE) {
         /* Linux MTU discovery is telling us our packet is too large. */
         dg->len = --parent->mtu;
@@ -377,7 +381,7 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
         }
       }
     }
-  } else if(lstream->tx_heap.size) {
+  } else if(!ack_only && lstream->tx_heap.size) {
     dg = (struct datagram*)_mstream_heap_pop(&lstream->tx_heap);
     ((uint16_t*)dg->buf)[4] = htons(lstream->packet_read_next);
     ((uint16_t*)dg->buf)[5] = htons(pop_ack(lstream));
@@ -390,9 +394,11 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
       void* extra = alloca(extra_len);
       memset(extra, 0, extra_len);
       TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, MSG_MORE));
-      res = TEMP_FAILURE_RETRY(send(parent->fd, extra, extra_len, 0));
+      res = TEMP_FAILURE_RETRY(send(parent->fd, extra, extra_len,
+                                    MSG_DONTWAIT));
     } else {
-      res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
+      res = TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len,
+                                    MSG_DONTWAIT));
     }
     if(res == -1 && errno == EMSGSIZE) {
       int oval;
@@ -401,12 +407,11 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
 
       int val = IP_PMTUDISC_DONT;
       setsockopt(parent->fd, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val));
-      TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len, 0));
+      TEMP_FAILURE_RETRY(send(parent->fd, dg->buf, dg->len,
+                              MSG_DONTWAIT));
       setsockopt(parent->fd, IPPROTO_IP, IP_MTU_DISCOVER, &oval, sizeof(oval));
     }
   } else {
-    assert(lstream->ack_size);
-
     /* Send a pure ACK packet. */
     char buf[HEADER_SIZE];
     *(uint32_t*)buf = htonl(lstream->id);
@@ -415,42 +420,41 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now) {
     ((uint16_t*)buf)[4] = htons(lstream->packet_read_next);
     ((uint16_t*)buf)[5] = htons(pop_ack(lstream));
     ((uint16_t*)buf)[6] = htons(pop_ack(lstream));
-    TEMP_FAILURE_RETRY(send(parent->fd, buf, HEADER_SIZE, 0));
+    TEMP_FAILURE_RETRY(send(parent->fd, buf, HEADER_SIZE, MSG_DONTWAIT));
   }
 
   /* Insert the datagram into the retransmit heap. */
   if(dg) {
     /* Make sure tx_last is up to date.  It might not have been set if we
      * started out as a pure ACK. */
-    parent->tx_last = max_time(parent->tx_last, lstream->tx_time);
+    parent->tx_last = max_time(parent->tx_last, now);
 
-    dg->rtx_time = now + _mstream_congestion_rtt(&parent->cinfo) +
+    dg->rtx_time = now + _mstream_congestion_rtt(&parent->cinfo) + 5000 +
               (time_val)sqrt(_mstream_congestion_rttvar(&parent->cinfo)) * 4;
     _mstream_heap_add(&lstream->rtx_heap, dg);
   }
 }
 
 static int acknowledge_packet(struct light_stream* lstream, uint16_t id,
-                              time_val now) {
+                              time_val now, int use_rtt) {
   struct mstream* parent = lstream->parent;
   struct datagram* dg = lstream->out_packets[id & (MAX_PACKETS - 1)];
   if(!dg || dg->tx_index != id || (int16_t)(id - lstream->last_pkt_nxt) < 0) {
     return 0;
-  }
-  if(parent->congestion_event && lstream->id == parent->congestion_event_lid &&
-     id == parent->congestion_event_pkt) {
-    /* We got the packet that started a congestion event.  We can now cancel
-     * the congestion event. */
-    parent->congestion_event = 0;
   }
 
   _mstream_heap_remove(&lstream->rtx_heap, dg);
   _mstream_heap_remove(&lstream->tx_heap, dg);
   lstream->out_packets[id & (MAX_PACKETS - 1)] = NULL;
 
-  if(!parent->congestion_event) {
-    _mstream_congestion_ack(&lstream->parent->cinfo,
-                            dg->tx_time ? now - dg->tx_time : 0);
+  if(dg->tx_time && use_rtt) {
+static time_val stime = 0;
+if(!stime) {
+stime = now;
+}
+printf("ACK %u - %u %p %zu %llu\n", lstream->id, id, dg, dg->tx_index,
+                            now - stime);
+    _mstream_congestion_ack(&lstream->parent->cinfo, now - dg->tx_time, now);
   }
 
   free(dg);
@@ -492,30 +496,36 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
   int fresh_data = 0;
   struct light_stream* lstream = stream_get_locked(stream, id);
 
-  for(; (int16_t)(lstream->last_pkt_nxt - pkt_nxt) < 0; ) {
-    if(!acknowledge_packet(lstream, lstream->last_pkt_nxt, now)) {
+  if(lstream->future_acks) {
+    stream->congested_streams--;
+  }
+
+  int use_ack = 1;
+  for(; (int16_t)(lstream->last_pkt_nxt - pkt_nxt) < 0; use_ack = 0) {
+    if(!acknowledge_packet(lstream, lstream->last_pkt_nxt, now, use_ack)) {
       --lstream->future_acks;
     }
     if(lstream->tx_seq_num == ++lstream->last_pkt_nxt) {
       pthread_cond_broadcast(&lstream->cond);
     }
   }
-
-  if(acknowledge_packet(lstream, ack_id1, now)) {
+  if(acknowledge_packet(lstream, ack_id1, now, 1)) {
     ++lstream->future_acks;
   }
-  if(acknowledge_packet(lstream, ack_id2, now)) {
+  if(acknowledge_packet(lstream, ack_id2, now, 1)) {
     ++lstream->future_acks;
+  }
+
+  if(lstream->future_acks) {
+    stream->congested_streams++;
+  }
+  if(stream->congested_streams == 0) {
+    stream->congestion_event = 0;
   }
 
   if(len && lstream) {
-    if((int16_t)(pkt_id - lstream->packet_pos) < (int16_t)MAX_PACKETS) {
-      ack_packet(lstream, pkt_id);
-    }
     if((uint16_t)(pkt_id - lstream->packet_pos) < MAX_PACKETS &&
               !lstream->packets[pkt_id & (MAX_PACKETS - 1)]) {
-      ack_packet(lstream, pkt_id);
-
       struct rdatagram* dg = lstream->packets[pkt_id & (MAX_PACKETS - 1)] =
           (struct rdatagram*)malloc(offsetof(struct rdatagram, buf) + len);
       dg->len = len;
@@ -537,6 +547,9 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
         ++lstream->packet_read_next;
       }
     }
+    if((int16_t)(pkt_id - lstream->packet_pos) < (int16_t)MAX_PACKETS) {
+      ack_packet(lstream, pkt_id);
+    }
   }
 
   /* Check if we need to do a fast retransmit. */
@@ -546,8 +559,6 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
     if(dg) {
       _mstream_congestion_rtx(&stream->cinfo);
       stream->congestion_event = 1;
-      stream->congestion_event_lid = lstream->id;
-      stream->congestion_event_pkt = pkt_nxt;
 
       _mstream_heap_remove(&lstream->rtx_heap, dg);
       _mstream_heap_remove(&lstream->tx_heap, dg);
@@ -557,6 +568,9 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
     }
   }
 
+  if(fresh_data) {
+    stream_list_push_locked(stream, lstream);
+  }
   pthread_mutex_unlock(&stream->lock);
 
   if(fresh_data && stream->arrival_func) {
@@ -582,19 +596,17 @@ void _mstream_transmit(struct light_stream* lstream, uint64_t now) {
 
     if(dg->tx_index == lstream->last_pkt_nxt) {
       _mstream_congestion_rto(&parent->cinfo);
-
-      parent->congestion_event = 1;
-      parent->congestion_event_lid = lstream->id;
-      parent->congestion_event_pkt = dg->tx_index;
+      //parent->congestion_event = 1;
     }
 
+printf("RTOOO\n");
     _mstream_heap_pop(&lstream->rtx_heap);
     _mstream_heap_add(&lstream->tx_heap, dg);
   }
 
   /* Attempt a write. */
   if(lstream->tx_time && time_less_eq(lstream->tx_time, now)) {
-    transmit_packet(lstream, now);
+    transmit_packet(lstream, now, 0);
     lstream->tx_time = 0;
   }
 
@@ -657,8 +669,8 @@ size_t mstream_write(struct mstream* stream, uint32_t id,
 size_t mstream_read(struct mstream* stream, uint32_t* id,
                     void* buf, size_t len, int flags) {
   size_t res;
+  pthread_mutex_lock(&stream->lock);
   if(*id == MSTREAM_IDANY) {
-    pthread_mutex_lock(&stream->lock);
     for(res = 0; !res; ) {
       if(~flags & MSG_DONTWAIT) {
         while(!stream->ready_head) {
@@ -672,8 +684,8 @@ size_t mstream_read(struct mstream* stream, uint32_t* id,
 
       int ready;
       struct light_stream* lstream = stream->ready_head;
-      res = lstream_read(stream->ready_head, buf, len,
-                         flags | MSG_DONTWAIT, &ready);
+      res = lstream_read_locked(stream->ready_head, buf, len,
+                                flags | MSG_DONTWAIT, &ready);
       *id = lstream->id;
 
       stream_list_pop_locked(stream);
@@ -681,11 +693,16 @@ size_t mstream_read(struct mstream* stream, uint32_t* id,
         stream_list_push_locked(stream, lstream);
       }
     }
-    pthread_mutex_unlock(&stream->lock);
   } else {
-    res = lstream_read(stream_get(stream, *id), buf, len, flags, NULL);
+    res = lstream_read_locked(stream_get(stream, *id), buf, len, flags, NULL);
   }
+  pthread_mutex_unlock(&stream->lock);
   return res;
+}
+
+void mstream_info(struct mstream* stream, struct stream_info* info) {
+  info->rtt = _mstream_congestion_rtt(&stream->cinfo);
+  info->rttvar = (time_val)sqrt(_mstream_congestion_rttvar(&stream->cinfo));
 }
 
 struct mstream* mstream_listen(struct mdaemon* daemon, int fd,

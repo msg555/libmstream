@@ -79,8 +79,7 @@ struct mstream {
 
   struct congestion_info cinfo;
   int congestion_event;
-  uint32_t congestion_event_lid;
-  uint16_t congestion_event_pkt;
+  uint32_t congested_streams;
   uint16_t mtu;
 
   pthread_mutex_t lock;
