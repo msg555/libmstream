@@ -694,7 +694,8 @@ size_t mstream_read(struct mstream* stream, uint32_t* id,
       }
     }
   } else {
-    res = lstream_read_locked(stream_get(stream, *id), buf, len, flags, NULL);
+    res = lstream_read_locked(stream_get_locked(stream, *id), buf,
+                              len, flags, NULL);
   }
   pthread_mutex_unlock(&stream->lock);
   return res;
