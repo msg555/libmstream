@@ -14,7 +14,7 @@ void _mstream_congestion_init(struct congestion_info* cinfo) {
 void _mstream_congestion_ack(struct congestion_info* cinfo, time_val rtt,
                              time_val now) {
   if(rtt) {
-printf("GOT RTT %llu %llu\n", cinfo->rtt, rtt);
+// printf("GOT RTT %llu %llu\n", cinfo->rtt, rtt);
     int shft = cinfo->slow_start ? 2 : 4;
     if(!cinfo->slow_start) {
       /* Don't allow rtt to grow too quickly. */

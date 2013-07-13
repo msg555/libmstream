@@ -21,8 +21,16 @@ struct rdatagram {
   char buf[1];
 };
 
+static void lstream_timer(struct timer_info* tinfo, uint64_t now);
+
 static void transmit_packet(struct light_stream* lstream, uint64_t now,
                             int ack_only);
+
+static void set_socket_options(int s) {
+  int buf_size = 4096;
+  setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+  setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+}
 
 static int datagram_compare_tx_order(void* px, void* py) {
   return (int16_t)(((struct datagram*)px)->tx_index -
@@ -37,11 +45,6 @@ static void datagram_set_tx_id(void *x, size_t id) {
   ((struct datagram*)x)->tx_heap_id = id;
 }
 
-static int datagram_compare_rtx_time(void* px, void* py) {
-  return (int64_t)(((struct datagram*)px)->rtx_time -
-                   ((struct datagram*)py)->rtx_time) < 0;
-}
-
 static size_t datagram_get_rtx_id(void *x) {
   return ((struct datagram*)x)->rtx_heap_id;
 }
@@ -54,13 +57,14 @@ static struct light_stream* lstream_create(struct mstream* stream,
                                            uint32_t id) {
   struct light_stream* lstream = (struct light_stream*)
         calloc(1, sizeof(struct light_stream));
+  lstream->tx_timer.timer_expired = lstream_timer;
   lstream->parent = stream;
   lstream->id = id;
   pthread_cond_init(&lstream->cond, NULL);
 
   _mstream_heap_init(&lstream->tx_heap, datagram_compare_tx_order,
                      datagram_get_tx_id, datagram_set_tx_id);
-  _mstream_heap_init(&lstream->rtx_heap, datagram_compare_rtx_time,
+  _mstream_heap_init(&lstream->rtx_heap, datagram_compare_tx_order,
                      datagram_get_rtx_id, datagram_set_rtx_id);
   lstream->tx_tail = &lstream->tx;
   return lstream;
@@ -74,55 +78,61 @@ static void lstream_destroy(struct light_stream* lstream) {
   free(lstream);
 }
 
+static void reset_timer(struct mdaemon* daemon, struct timer_info* tinfo,
+                        time_val ntime) {
+  int nz = tinfo->time != 0;
+  if(tinfo->time == ntime) {
+    return;
+  }
+
+  pthread_mutex_lock(&daemon->lock);
+  tinfo->time = ntime;
+  if(ntime == 0) {
+    if(nz) {
+      _mstream_heap_remove(&daemon->timer_heap, tinfo);
+    }
+  } else if(nz) {
+    _mstream_heap_adjust(&daemon->timer_heap, tinfo);
+  } else {
+    _mstream_heap_add(&daemon->timer_heap, tinfo);
+  }
+  _mstream_daemon_adjust_timer(daemon);
+  pthread_mutex_unlock(&daemon->lock);
+}
+
+static void reset_rto_timer(struct mstream* stream, time_val now) {
+  if(now) {
+    reset_timer(stream->daemon, &stream->rto_timer, now + 1000 +
+              _mstream_congestion_rtt(&stream->cinfo) +
+              (time_val)sqrt(_mstream_congestion_rttvar(&stream->cinfo)) * 4);
+  } else {
+    reset_timer(stream->daemon, &stream->rto_timer, 0);
+  }
+}
+
 static void recompute_times(struct light_stream* lstream, time_val now) {
   struct mstream* parent = lstream->parent;
 
-  if(lstream->tx_time == 0) {
+  time_val ntime = lstream->tx_timer.time;
+  if(lstream->tx_timer.time == 0) {
     if((lstream->tx.buf_size &&
         !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) ||
         lstream->tx_heap.size) {
       /* Schedule a packet write. */
-      parent->tx_last = lstream->tx_time = max_time(now,
+      parent->tx_last = ntime = max_time(now,
           parent->tx_last + _mstream_congestion_spacing(&parent->cinfo));
     } else if(lstream->ack_size) {
       /* Schedule a pure ACK. */
-      lstream->tx_time = max_time(now,
+      ntime = max_time(now,
           parent->tx_last + _mstream_congestion_spacing(&parent->cinfo));
     }
   } else if(!((lstream->tx.buf_size &&
-              !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) ||
-              lstream->tx_heap.size || lstream->ack_size)) {
-    lstream->tx_time = 0;
+            !lstream->out_packets[lstream->tx_seq_num & (MAX_PACKETS - 1)]) ||
+            lstream->tx_heap.size || lstream->ack_size)) {
+    ntime = 0;
   }
 
-  uint64_t rtx_time = !lstream->rtx_heap.size ? 0 :
-        ((struct datagram*)_mstream_heap_top(&lstream->rtx_heap))->rtx_time;
-
-  time_val ntime = lstream->tx_time;
-  if(ntime && rtx_time) {
-    ntime = min_time(ntime, rtx_time);
-  } else if(rtx_time) {
-    ntime = rtx_time;
-  }
-
-  if(ntime != lstream->time) {
-    pthread_mutex_lock(&parent->daemon->lock);
-    if(ntime) {
-      int need_add = lstream->time == 0;
-      lstream->time = ntime;
-
-      if(need_add) {
-        _mstream_heap_add(&parent->daemon->stream_heap, lstream);
-      } else {
-        _mstream_heap_adjust(&parent->daemon->stream_heap, lstream);
-      }
-    } else {
-      lstream->time = 0;
-      _mstream_heap_remove(&parent->daemon->stream_heap, lstream);
-    }
-    _mstream_daemon_adjust_timer(parent->daemon);
-    pthread_mutex_unlock(&parent->daemon->lock);
-  }
+  reset_timer(lstream->parent->daemon, &lstream->tx_timer, ntime);
 }
 
 static size_t lstream_write(struct light_stream* lstream, const void* buf,
@@ -231,7 +241,8 @@ static size_t lstream_read_locked(struct light_stream* lstream, void* buf,
 
 static void lstream_flush(struct light_stream* lstream) {
   pthread_mutex_lock(&lstream->parent->lock);
-  while(lstream->time || lstream->last_pkt_nxt != lstream->tx_seq_num) {
+  while(lstream->tx_timer.time ||
+        lstream->last_pkt_nxt != lstream->tx_seq_num) {
     pthread_cond_wait(&lstream->cond, &lstream->parent->lock);
   }
   pthread_mutex_unlock(&lstream->parent->lock);
@@ -262,14 +273,14 @@ static struct light_stream* stream_get(struct mstream* stream, uint32_t id) {
   return ret;
 }
 
-static void stream_list_push_locked(struct mstream* stream,
-                                    struct light_stream* lstream) {
+static void stream_ready_push(struct mstream* stream,
+                              struct light_stream* lstream) {
   /* Already in the ready list. */
-  if(lstream->next) return;
+  if(lstream->ready_next) return;
 
-  lstream->next = lstream;
+  lstream->ready_next = lstream;
   if(stream->ready_head) {
-    stream->ready_tail->next = lstream;
+    stream->ready_tail->ready_next = lstream;
     stream->ready_tail = lstream;
   } else {
     stream->ready_head = stream->ready_tail = lstream;
@@ -277,14 +288,40 @@ static void stream_list_push_locked(struct mstream* stream,
   }
 }
 
-static void stream_list_pop_locked(struct mstream* stream) {
+static struct light_stream* stream_ready_pop(struct mstream* stream) {
   struct light_stream* head = stream->ready_head;
-  if(head->next) {
-    stream->ready_head = head->next;
-    head->next = NULL;
+  if(head->ready_next != head) {
+    stream->ready_head = head->ready_next;
+    head->ready_next = NULL;
   } else {
-    head->next = stream->ready_head = stream->ready_tail = NULL;
+    head->ready_next = stream->ready_head = stream->ready_tail = NULL;
   }
+  return head;
+}
+
+static void stream_pending_push(struct mstream* stream,
+                                struct light_stream* lstream) {
+  /* Already in the ready list. */
+  if(lstream->pending_next) return;
+
+  lstream->pending_next = lstream;
+  if(stream->pending_head) {
+    stream->pending_tail->pending_next = lstream;
+    stream->pending_tail = lstream;
+  } else {
+    stream->pending_head = stream->pending_tail = lstream;
+  }
+}
+
+static struct light_stream* stream_pending_pop(struct mstream* stream) {
+  struct light_stream* head = stream->pending_head;
+  if(head->pending_next != head) {
+    stream->pending_head = head->pending_next;
+    head->pending_next = NULL;
+  } else {
+    head->pending_next = stream->pending_head = stream->pending_tail = NULL;
+  }
+  return head;
 }
 
 static uint16_t pop_ack(struct light_stream* lstream) {
@@ -381,6 +418,8 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now,
         }
       }
     }
+
+    stream_pending_push(parent, lstream);
   } else if(!ack_only && lstream->tx_heap.size) {
     dg = (struct datagram*)_mstream_heap_pop(&lstream->tx_heap);
     ((uint16_t*)dg->buf)[4] = htons(lstream->packet_read_next);
@@ -425,12 +464,6 @@ static void transmit_packet(struct light_stream* lstream, uint64_t now,
 
   /* Insert the datagram into the retransmit heap. */
   if(dg) {
-    /* Make sure tx_last is up to date.  It might not have been set if we
-     * started out as a pure ACK. */
-    parent->tx_last = max_time(parent->tx_last, now);
-
-    dg->rtx_time = now + _mstream_congestion_rtt(&parent->cinfo) + 5000 +
-              (time_val)sqrt(_mstream_congestion_rttvar(&parent->cinfo)) * 4;
     _mstream_heap_add(&lstream->rtx_heap, dg);
   }
 }
@@ -448,12 +481,6 @@ static int acknowledge_packet(struct light_stream* lstream, uint16_t id,
   lstream->out_packets[id & (MAX_PACKETS - 1)] = NULL;
 
   if(dg->tx_time && use_rtt) {
-static time_val stime = 0;
-if(!stime) {
-stime = now;
-}
-printf("ACK %u - %u %p %zu %llu\n", lstream->id, id, dg, dg->tx_index,
-                            now - stime);
     _mstream_congestion_ack(&lstream->parent->cinfo, now - dg->tx_time, now);
   }
 
@@ -568,8 +595,16 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
     }
   }
 
+  /* Check if any streams still have pending data and reset the rto timer
+   * appropriately. */
+  while(stream->pending_head && stream->pending_head->last_pkt_nxt ==
+                                stream->pending_head->tx_seq_num) {
+    stream_pending_pop(stream);
+  }
+  reset_rto_timer(stream, stream->pending_head ? now : 0);
+
   if(fresh_data) {
-    stream_list_push_locked(stream, lstream);
+    stream_ready_push(stream, lstream);
   }
   pthread_mutex_unlock(&stream->lock);
 
@@ -578,41 +613,19 @@ void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
   }
 }
 
-void _mstream_transmit(struct light_stream* lstream, uint64_t now) {
+static void lstream_timer(struct timer_info* tinfo, uint64_t now) {
+  struct light_stream* lstream = (struct light_stream*)
+        ((char*)tinfo - offsetof(struct light_stream, tx_timer));
   struct mstream* parent = lstream->parent;
 
   pthread_mutex_lock(&parent->lock);
-  lstream->time = 0;
-
-  /* Expire retransmits */
-  while(lstream->rtx_heap.size > 0) {
-    struct datagram* dg = (struct datagram*)
-          _mstream_heap_top(&lstream->rtx_heap);
-    if(time_less(now, dg->rtx_time)) {
-      break;
-    }
-    /* RTOs should always trigger a congestion event so that we'll always back
-     * off if the remote stops responding. */
-
-    if(dg->tx_index == lstream->last_pkt_nxt) {
-      _mstream_congestion_rto(&parent->cinfo);
-      //parent->congestion_event = 1;
-    }
-
-printf("RTOOO\n");
-    _mstream_heap_pop(&lstream->rtx_heap);
-    _mstream_heap_add(&lstream->tx_heap, dg);
-  }
 
   /* Attempt a write. */
-  if(lstream->tx_time && time_less_eq(lstream->tx_time, now)) {
-    transmit_packet(lstream, now, 0);
-    lstream->tx_time = 0;
-  }
+  transmit_packet(lstream, now, 0);
 
+  reset_timer(parent->daemon, &lstream->tx_timer, 0);
   recompute_times(lstream, now);
-
-  if(lstream->time == 0) {
+  if(lstream->tx_timer.time == 0) {
     /* Nothing to schedule, notify those waiting in flush. */
     pthread_cond_broadcast(&lstream->cond);
   }
@@ -620,15 +633,50 @@ printf("RTOOO\n");
   pthread_mutex_unlock(&parent->lock);
 }
 
+static void mstream_timer(struct timer_info* tinfo, uint64_t now) {
+  struct mstream* stream = (struct mstream*)
+        ((char*)tinfo - offsetof(struct mstream, rto_timer));
+
+  pthread_mutex_lock(&stream->lock);
+printf("RTO!");
+
+  struct light_stream* new_head = NULL;
+  struct light_stream* new_tail = NULL;
+  while(stream->pending_head) {
+    struct light_stream* lstream = stream_pending_pop(stream);
+    if(lstream->last_pkt_nxt != lstream->tx_seq_num) {
+      if(lstream->rtx_heap.size) {
+        struct datagram* dg = (struct datagram*)
+              _mstream_heap_pop(&lstream->rtx_heap);
+        _mstream_heap_add(&lstream->tx_heap, dg);
+        recompute_times(lstream, now);
+      }
+
+      lstream->pending_next = new_head ? new_head : lstream;
+      new_head = lstream;
+      new_tail = new_tail ? new_tail : lstream;
+    }
+  }
+  stream->pending_head = new_head;
+  stream->pending_tail = new_tail;
+
+  reset_timer(stream->daemon, &stream->rto_timer, now + 2000000);
+
+  pthread_mutex_unlock(&stream->lock);
+}
+
 /* libmstream public API */
 
 struct mstream* mstream_create(struct mdaemon* daemon, int fd,
                                data_arrival arrival_func) {
   struct mstream* stream = (struct mstream*)calloc(1, sizeof(struct mstream));
+  stream->rto_timer.timer_expired = mstream_timer;
   stream->daemon = daemon;
   stream->fd = fd;
   stream->arrival_func = arrival_func;
   stream->mtu = MAX_MTU;
+
+  set_socket_options(fd);
 
   _mstream_congestion_init(&stream->cinfo);
 
@@ -688,9 +736,9 @@ size_t mstream_read(struct mstream* stream, uint32_t* id,
                                 flags | MSG_DONTWAIT, &ready);
       *id = lstream->id;
 
-      stream_list_pop_locked(stream);
+      stream_ready_pop(stream);
       if(ready) {
-        stream_list_push_locked(stream, lstream);
+        stream_ready_push(stream, lstream);
       }
     }
   } else {
@@ -730,6 +778,7 @@ struct mstream* mstream_listen(struct mdaemon* daemon, int fd,
   if(s == -1) {
     return NULL;
   }
+  set_socket_options(fd);
 
   int val = 1;
   if(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(int)) == -1) {

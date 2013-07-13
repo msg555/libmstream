@@ -16,8 +16,6 @@ struct rdatagram;
 struct datagram {
   size_t tx_index;
   size_t tx_heap_id;
-
-  time_val rtx_time;
   size_t rtx_heap_id;
 
   size_t tx_count;
@@ -34,20 +32,25 @@ struct data_block {
   char buf[TX_BUFFER_SIZE];
 };
 
+struct timer_info {
+  time_val time;
+  size_t heap_id;
+  void (*timer_expired)(struct timer_info*, time_val);
+};
+
 struct light_stream {
+  struct timer_info tx_timer;
+
   struct mstream* parent;
   uint32_t id;
-  size_t heap_id;
 
   pthread_cond_t cond;
 
-  struct light_stream* next;
+  struct light_stream* pending_next;
+  struct light_stream* ready_next;
 
   uint16_t tx_seq_num;
   uint16_t packet_read_next;
-
-  time_val time;
-  time_val tx_time;
 
   struct heap tx_heap;
   struct heap rtx_heap;
@@ -68,6 +71,8 @@ struct light_stream {
 };
 
 struct mstream {
+  struct timer_info rto_timer;
+
   struct mdaemon* daemon;
   int fd;
   data_arrival arrival_func;
@@ -85,13 +90,13 @@ struct mstream {
   pthread_mutex_t lock;
   pthread_cond_t cond;
 
+  struct light_stream* pending_head;
+  struct light_stream* pending_tail;
   struct light_stream* ready_head;
   struct light_stream* ready_tail;
 };
 
 void _mstream_datagram_arrived(struct mstream* stream, const void* buf,
                                size_t amt, time_val now);
-
-void _mstream_transmit(struct light_stream* stream, uint64_t now);
 
 #endif

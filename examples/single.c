@@ -17,6 +17,9 @@ void print_usage(FILE* fout, const char* argv0) {
 void data(struct mstream* stream, uint32_t id) {
 }
 
+#define ROUNDS (100*1024)
+//#define ROUNDS 100
+
 int main(int argc, char** argv) {
   int is_host = 0;
   char* argv0 = argv[0];
@@ -112,7 +115,7 @@ int main(int argc, char** argv) {
   for(i = 0; i < sizeof(buf); i++) {
     buf[i] = i & 0xFF;
   }
-  for(i = 0; i < 100*1024; i++) {
+  for(i = 0; i < ROUNDS; i++) {
     size_t pos = 0;
     while(pos < sizeof(buf)) {
       pos += mstream_write(stream, 0, (char*)buf + pos, sizeof(buf) - pos,
@@ -121,7 +124,7 @@ int main(int argc, char** argv) {
   }
 
   uint32_t id = 0;
-  for(i = 0; i < 100*1024; i++) {
+  for(i = 0; i < ROUNDS; i++) {
     size_t pos = 0;
     while(pos < sizeof(buf)) {
       pos += mstream_read(stream, &id,

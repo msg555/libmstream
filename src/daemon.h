@@ -23,7 +23,7 @@ struct mstream;
 struct light_stream;
 
 struct mdaemon {
-  struct heap stream_heap;
+  struct heap timer_heap;
 
   int epollfd;
   int timerfd;

@@ -17,17 +17,17 @@
 
 static const size_t MAX_EVENTS = 32;
 
-static int stream_compare(void* px, void *py) {
-  return (int64_t)(((struct light_stream*)px)->time -
-                   ((struct light_stream*)py)->time) < 0;
+static int timer_compare(void* px, void *py) {
+  return (int64_t)(((struct timer_info*)px)->time -
+                   ((struct timer_info*)py)->time) < 0;
 }
 
-static size_t stream_get_heap_id(void* x) {
-  return ((struct light_stream*)x)->heap_id;
+static size_t timer_get_heap_id(void* x) {
+  return ((struct timer_info*)x)->heap_id;
 }
 
-static void stream_set_heap_id(void* x, size_t id) {
-  ((struct light_stream*)x)->heap_id = id;
+static void timer_set_heap_id(void* x, size_t id) {
+  ((struct timer_info*)x)->heap_id = id;
 }
 
 static void* daemon_thread(void* parg) {
@@ -58,19 +58,18 @@ static void* daemon_thread(void* parg) {
         if(self->cur_timer) {
           now = max_time(now, self->cur_timer);
           self->cur_timer = 0;
-          while(self->stream_heap.size) {
-            struct light_stream* lstream = (struct light_stream*)
-                _mstream_heap_top(&self->stream_heap);
-            if(time_less(now, lstream->time)) {
+          while(self->timer_heap.size) {
+            struct timer_info* tinfo = (struct timer_info*)
+                _mstream_heap_top(&self->timer_heap);
+            if(time_less(now, tinfo->time)) {
               break;
             }
 
-            _mstream_heap_pop(&self->stream_heap);
-
             pthread_mutex_unlock(&self->lock);
-            _mstream_transmit(lstream, now);
+            tinfo->timer_expired(tinfo, now);
             pthread_mutex_lock(&self->lock);
           }
+          _mstream_daemon_adjust_timer(self);
         }
         pthread_mutex_unlock(&self->lock);
 
@@ -82,10 +81,6 @@ static void* daemon_thread(void* parg) {
         }
       }
     }
-
-    pthread_mutex_lock(&self->lock);
-    _mstream_daemon_adjust_timer(self);
-    pthread_mutex_unlock(&self->lock);
   }
   return NULL;
 }
@@ -105,8 +100,8 @@ void _mstream_detach_stream(struct mdaemon* daemon, struct mstream* stream) {
 }
 
 void _mstream_daemon_adjust_timer(struct mdaemon* daemon) {
-  time_val ntime = !daemon->stream_heap.size ? 0 :
-        ((struct light_stream*)_mstream_heap_top(&daemon->stream_heap))->time;
+  time_val ntime = !daemon->timer_heap.size ? 0 :
+        ((struct timer_info*)_mstream_heap_top(&daemon->timer_heap))->time;
   if(daemon->thread_shutdown) {
     ntime = _mstream_get_time();
   }
@@ -137,8 +132,8 @@ struct mdaemon* mstream_daemon_create() {
   epoll_ctl(daemon->epollfd, EPOLL_CTL_ADD, daemon->timerfd, &ev);
 
   pthread_mutex_init(&daemon->lock, NULL);
-  _mstream_heap_init(&daemon->stream_heap, stream_compare,
-                     stream_get_heap_id, stream_set_heap_id);
+  _mstream_heap_init(&daemon->timer_heap, timer_compare,
+                     timer_get_heap_id, timer_set_heap_id);
   return daemon;
 }
 
@@ -159,6 +154,6 @@ void mstream_daemon_destroy(struct mdaemon* daemon) {
   close(daemon->epollfd);
   close(daemon->timerfd);
   pthread_mutex_destroy(&daemon->lock);
-  _mstream_heap_destroy(&daemon->stream_heap);
+  _mstream_heap_destroy(&daemon->timer_heap);
   free(daemon);
 }
