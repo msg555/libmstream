@@ -46,6 +46,8 @@ static void* daemon_thread(void* parg) {
     time_val now = _mstream_get_time();
     for(ei = events, ee = events + nfds; ei != ee; ++ei) {
       if(ei->data.ptr == NULL) {
+        time_val timer;
+
         /* NULL data pointer indicates a timer expiration. */
         for(;;) {
           if(TEMP_FAILURE_RETRY(read(self->timerfd, buf, sizeof(buf))) == -1) {
@@ -55,9 +57,10 @@ static void* daemon_thread(void* parg) {
 
         /* Process any timer expirations allowing writes/retransmits. */
         pthread_mutex_lock(&self->lock);
-        if(self->cur_timer) {
+        timer = self->cur_timer;
+        self->cur_timer = 0;
+        if(timer && time_less(timer, now + 100)) {
           now = max_time(now, self->cur_timer);
-          self->cur_timer = 0;
           while(self->timer_heap.size) {
             struct timer_info* tinfo = (struct timer_info*)
                 _mstream_heap_top(&self->timer_heap);
@@ -69,8 +72,8 @@ static void* daemon_thread(void* parg) {
             tinfo->timer_expired(tinfo, now);
             pthread_mutex_lock(&self->lock);
           }
-          _mstream_daemon_adjust_timer(self);
         }
+        _mstream_daemon_adjust_timer(self);
         pthread_mutex_unlock(&self->lock);
 
       } else {
